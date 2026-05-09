@@ -48,7 +48,15 @@ Hệ thống quản lý các hợp đồng vay tiền thế chấp tài sản (c
 | `HopDong_TaiSan` | Bảng trung gian (N:M) | Lưu giá trị định giá |
 | `LichSuGiaoDich` | Audit log mỗi lần trả | 1 Hợp Đồng → nhiều Giao Dịch |
 | `NhanVien` | Người thu tiền | 1 Nhân Viên → nhiều Giao  |
-
+```
+KhachHang (1) ──────────< HopDong (N)
+                               │
+                    ┌──────────┤
+                    │          │
+                    v          v
+          LichSuThanhToan    TaiSan
+               (N)            (N)
+```
 ---
 
 ## 3. Thiết kế cơ sở dữ liệu 
