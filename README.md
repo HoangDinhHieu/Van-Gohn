@@ -679,4 +679,290 @@ ORDER BY lst.[NgayTra] DESC;
 *Bảng LichSuThanhToan ghi lại đầy đủ: ai trả, bao nhiêu, dư nợ trước và sau — không bao giờ ghi đè, không mất dấu vết dòng tiền*
 
 ---
+## Event 4: Truy Vấn Danh Sách Nợ Xấu
+
+### Ý Tưởng (Scenario): "Bảng cảnh báo đỏ mỗi sáng của ban giám đốc"
+
+**Tình huống:** Mỗi buổi sáng, giám đốc cần xem danh sách các hợp đồng đã vượt Deadline1 mà chưa thanh toán — kèm dự báo số tiền nợ sẽ là bao nhiêu sau 1 tháng nữa nếu không can thiệp. Cột dự báo giúp đánh giá mức độ rủi ro tăng của từng khách do lãi kép.
+
+```sql
+CREATE FUNCTION [dbo].[fn_DanhSachNoXau]()
+RETURNS TABLE
+AS
+RETURN
+(
+    SELECT
+        kh.[HoTen]                              AS [TenKhachHang],
+        kh.[SoDienThoai],
+        hd.[MaHopDong],
+        hd.[SoTienVay]                          AS [SoTienVayGoc],
+        hd.[NgayVay],
+        hd.[Deadline1],
+        DATEDIFF(DAY, hd.[Deadline1], GETDATE()) AS [SoNgayQuaHan],
+        dbo.[fn_CalcMoneyTransaction](
+            hd.[MaHopDong],
+            CAST(GETDATE() AS DATE)
+        )                                       AS [TongTienPhaiTraHomNay],
+        dbo.[fn_CalcMoneyTransaction](
+            hd.[MaHopDong],
+            CAST(DATEADD(MONTH, 1, GETDATE()) AS DATE)
+        )                                       AS [TongTienPhaiTraSau1Thang],
+        hd.[TrangThai]
+    FROM [HopDong] hd
+    JOIN [KhachHang] kh ON hd.[MaKhachHang] = kh.[MaKhachHang]
+    WHERE hd.[Deadline1] < CAST(GETDATE() AS DATE)
+      AND hd.[TrangThai] NOT IN (N'Đã thanh toán', N'Đã thanh lý')
+);
+GO
+
+-- Khai thác
+SELECT * FROM dbo.[fn_DanhSachNoXau]()
+ORDER BY [SoNgayQuaHan] DESC;
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/78aab3ab-948f-45ac-bd12-37dd1f453084" />
+
+*Danh sách nợ xấu sắp xếp theo số ngày quá hạn giảm dần. Cột TongTienPhaiTraSau1Thang cho thấy mức tăng đáng kể do lãi kép — khách nào càng để lâu, gánh nặng tăng càng nhanh*
+
+---
+## Event 5: Quản Lý Thanh Lý Tài Sản (Trigger)
+
+### Ý Tưởng (Scenario): "Hệ thống cảnh báo và tự động hóa — không cần nhân viên nhớ"
+
+**Tình huống:** Tiệm cầm đồ có hàng trăm hợp đồng. Không thể hàng ngày ngồi check từng hợp đồng xem cái nào quá hạn. Ba Trigger dưới đây tự động vận hành vòng đời của hợp đồng và tài sản — không cần can thiệp thủ công.
+
+### Trigger 1: trg_CapNhatQuaHan
+
+Khi hợp đồng đang `'Đang vay'` mà đã vượt Deadline1 → tự động chuyển sang `'Quá hạn (nợ xấu)'`.
+
+```sql
+CREATE TRIGGER [trg_CapNhatQuaHan]
+ON [HopDong]
+AFTER INSERT, UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE [HopDong]
+    SET [TrangThai] = N'Quá hạn (nợ xấu)'
+    WHERE [TrangThai] = N'Đang vay'
+      AND [Deadline1] < CAST(GETDATE() AS DATE)
+      AND [MaHopDong] IN (SELECT [MaHopDong] FROM [inserted]);
+
+    IF @@ROWCOUNT > 0
+        PRINT N'[Trigger 1]: Da cap nhat sang "Qua han (no xau)"';
+END;
+GO
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/eb3cf53c-fc6c-4162-acad-2d3f2c9de7de" />
+
+*Trigger 1 kích hoạt sau mỗi INSERT/UPDATE trên HopDong — nếu Deadline1 đã qua mà vẫn "Đang vay" thì tự động chuyển trạng thái*
+
+```sql
+-- Demo: Tạo hợp đồng với Deadline1 trong quá khứ để trigger kích hoạt
+EXEC [dbo].[sp_TiepNhanHopDong]
+    @HoTen       = N'Trần Thị Bình',
+    @SoDienThoai = '0987654321',
+    @SoTienVay   = 10000000,
+    @NgayVay     = '2026-03-01',
+    @Deadline1   = '2026-03-31',  -- Đã quá hạn
+    @Deadline2   = '2026-04-30',
+    @TenTaiSan1  = N'Laptop Dell Inspiron 15',
+    @GiaTri1     = 12000000;
+
+-- Kiểm tra: TrangThai đã tự động chuyển chưa?
+SELECT [MaHopDong], [TrangThai], [Deadline1]
+FROM [HopDong] WHERE [MaKhachHang] = 2;
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/3f97e99d-9b3a-42d1-98ac-ff193c471693" />
+
+*Ngay sau khi INSERT, Trigger 1 kích hoạt và TrangThai tự động đổi sang "Quá hạn (nợ xấu)" trong cùng transaction — không cần chạy lệnh UPDATE riêng*
+
+---
+
+### Trigger 2: trg_CapNhatSanSangThanhLy
+
+Khi hợp đồng chuyển sang `'Quá hạn (nợ xấu)'` **và** đã vượt Deadline2 → tự động chuyển tài sản sang `'Sẵn sàng thanh lý'`.
+
+```sql
+CREATE TRIGGER [trg_CapNhatSanSangThanhLy]
+ON [HopDong]
+AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF UPDATE([TrangThai])
+    BEGIN
+        UPDATE [TaiSan]
+        SET [TrangThai] = N'Sẵn sàng thanh lý'
+        WHERE [MaHopDong] IN (
+            SELECT i.[MaHopDong]
+            FROM [inserted] i
+            WHERE i.[TrangThai] = N'Quá hạn (nợ xấu)'
+              AND i.[Deadline2] < CAST(GETDATE() AS DATE)
+        )
+        AND [TrangThai] = N'Đang cầm cố';
+
+        IF @@ROWCOUNT > 0
+            PRINT N'[Trigger 2]: Da chuyen tai san sang "San sang thanh ly"';
+    END
+END;
+GO
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/0bb2405f-6eb6-42bd-a166-df2f624b3801" />
+
+*Trigger 2 lắng nghe sự kiện UPDATE trên HopDong — khi TrangThai vừa đổi sang "Quá hạn" mà Deadline2 đã qua, tất cả tài sản đang cầm cố được chuyển sang "Sẵn sàng thanh lý"*
+
+---
+
+### Trigger 3: trg_CapNhatDaBanThanhLy
+
+Khi nhân viên cập nhật hợp đồng thành `'Đã thanh lý'` → tự động chuyển toàn bộ tài sản còn lại sang `'Đã bán thanh lý'`.
+
+```sql
+CREATE TRIGGER [trg_CapNhatDaBanThanhLy]
+ON [HopDong]
+AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF UPDATE([TrangThai])
+    BEGIN
+        UPDATE [TaiSan]
+        SET [TrangThai] = N'Đã bán thanh lý'
+        WHERE [MaHopDong] IN (
+            SELECT i.[MaHopDong]
+            FROM [inserted] i
+            WHERE i.[TrangThai] = N'Đã thanh lý'
+        )
+        AND [TrangThai] IN (N'Đang cầm cố', N'Sẵn sàng thanh lý');
+
+        IF @@ROWCOUNT > 0
+            PRINT N'[Trigger 3]: Da chuyen tai san sang "Da ban thanh ly"';
+    END
+END;
+GO
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/0682d334-5c37-448a-ad4e-049173d7f076" />
+
+*Ba Trigger hoạt động phối hợp tạo thành vòng đời tự động hoàn chỉnh của hợp đồng và tài sản*
+
+```sql
+-- Demo chuỗi Trigger: Cập nhật hợp đồng sang "Đã thanh lý"
+UPDATE [HopDong]
+SET [TrangThai] = N'Đã thanh lý'
+WHERE [MaHopDong] = 4;
+
+-- Kiểm tra: Tài sản đã tự động đổi sang "Đã bán thanh lý" chưa?
+SELECT [MaTaiSan], [TenTaiSan], [TrangThai]
+FROM [TaiSan]
+WHERE [MaHopDong] = 4;
+```
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/8f7362bc-7260-4e46-a304-e90c4f8407ca" />
+
+*Tab Messages hiển thị "[Trigger 3]: Da chuyen tai san sang Đã bán thanh lý". Bảng TaiSan tự động cập nhật — không cần nhân viên nhớ chạy lệnh UPDATE riêng cho từng tài sản*
+
+---
+
+## Sự Kiện Bổ Sung 1: Gia Hạn Hợp Đồng
+
+### Ý Tưởng (Scenario): "Khách muốn né lãi kép — trả lãi để reset đồng hồ"
+
+**Tình huống:** Khách gần đến Deadline1 nhưng chưa đủ tiền trả gốc. Họ có thể trả toàn bộ tiền lãi tích lũy để "làm mới" hợp đồng với 2 Deadline mới — tránh bị tính lãi kép, đồng hồ lãi bắt đầu lại từ đầu.
+
+```sql
+CREATE PROCEDURE [dbo].[sp_GiaHanHopDong]
+    @MaHopDong      INT,
+    @Deadline1Moi   DATE,
+    @Deadline2Moi   DATE,
+    @NhanVienThu    NVARCHAR(150)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @TrangThaiHD NVARCHAR(30);
+    DECLARE @SoTienVay   MONEY;
+
+    SELECT @TrangThaiHD = [TrangThai], @SoTienVay = [SoTienVay]
+    FROM [HopDong] WHERE [MaHopDong] = @MaHopDong;
+
+    IF @TrangThaiHD IN (N'Đã thanh toán', N'Đã thanh lý')
+    BEGIN
+        RAISERROR(N'Hop dong nay da ket thuc, khong the gia han!', 16, 1);
+        RETURN;
+    END
+
+    DECLARE @NgayHomNay DATE = CAST(GETDATE() AS DATE);
+
+    -- Tính tiền lãi phải trả để gia hạn = TổngNợ - Gốc
+    DECLARE @TongNo      MONEY = dbo.[fn_CalcMoneyTransaction](@MaHopDong, @NgayHomNay);
+    DECLARE @TienLaiPhaiTra MONEY = @TongNo - @SoTienVay;
+    IF @TienLaiPhaiTra < 0 SET @TienLaiPhaiTra = 0;
+
+    -- Ghi log khoản trả lãi
+    IF @TienLaiPhaiTra > 0
+        INSERT INTO [LichSuThanhToan]
+            ([MaHopDong],[NgayTra],[SoTienTra],[NhanVienThu],
+             [DuNoTruocKhi],[DuNoSauKhi],[GhiChu])
+        VALUES
+            (@MaHopDong, GETDATE(), @TienLaiPhaiTra, @NhanVienThu,
+             @TongNo, @SoTienVay, N'Tra lai de gia han hop dong');
+
+    -- Cập nhật Deadline mới và reset trạng thái
+    UPDATE [HopDong]
+    SET [Deadline1] = @Deadline1Moi,
+        [Deadline2] = @Deadline2Moi,
+        [TrangThai] = N'Đang vay'
+    WHERE [MaHopDong] = @MaHopDong;
+
+    PRINT N'Gia han thanh cong!';
+    PRINT N'Tien lai da thu: ' + FORMAT(@TienLaiPhaiTra, 'N0') + N'd';
+    PRINT N'Deadline1 moi  : ' + CONVERT(NVARCHAR, @Deadline1Moi, 103);
+    PRINT N'Deadline2 moi  : ' + CONVERT(NVARCHAR, @Deadline2Moi, 103);
+END;
+GO
+
+-- Khai thác: Gia hạn hợp đồng số 1
+EXEC [dbo].[sp_GiaHanHopDong]
+    @MaHopDong    = 1,
+    @Deadline1Moi = '2026-06-01',
+    @Deadline2Moi = '2026-07-01',
+    @NhanVienThu  = N'Hoàng Đình Hiếu';
+GO
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/87a7d810-188c-4e9e-b756-c45345f12849" />
+
+*SP in ra số tiền lãi đã thu và 2 deadline mới. Hợp đồng reset về "Đang vay" — từ đây lại tính lãi đơn từ đầu. Khoản trả lãi được ghi vào LichSuThanhToan với GhiChu = "Tra lai de gia han hop dong"*
+
+---
+
+## Sự Kiện Bổ Sung 2: Lịch Sử Hợp Đồng (Audit Log)
+
+### Tại Sao Cần Audit Log?
+
+Nếu chỉ lưu một con số "tổng nợ hiện tại" vào bảng HopDong thì khi khách trả từng phần, con số đó bị ghi đè — mất hoàn toàn dấu vết dòng tiền. Không thể trả lời: "Ngày 15/4 khách đã trả bao nhiêu? Ai là người thu tiền? Lúc đó dư nợ là bao nhiêu?"
+
+Bảng `LichSuThanhToan` giải quyết vấn đề này bằng cách **chỉ INSERT, không bao giờ UPDATE hay DELETE**.
+
+```sql
+-- Xem toàn bộ lịch sử thanh toán của 1 hợp đồng
+SELECT
+    lst.[MaLichSu],
+    lst.[NgayTra],
+    FORMAT(lst.[SoTienTra],    'N0') AS [SoTienTra],
+    FORMAT(lst.[DuNoTruocKhi], 'N0') AS [DuNoTruocKhi],
+    FORMAT(lst.[DuNoSauKhi],   'N0') AS [DuNoSauKhi],
+    lst.[NhanVienThu],
+    ISNULL(lst.[GhiChu], N'Thanh toán thông thường') AS [GhiChu]
+FROM [LichSuThanhToan] lst
+WHERE lst.[MaHopDong] = 1
+ORDER BY lst.[NgayTra] ASC;
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/6ba7fbdb-819d-4c93-8de8-a285ca8837c3" />
+
+*Mỗi dòng là 1 lần trả tiền — có thể reconstruct toàn bộ lịch sử dòng tiền của hợp đồng bất kỳ lúc nào. DuNoTruocKhi và DuNoSauKhi của dòng N phải khớp với DuNoSauKhi của dòng N-1 — đảm bảo tính liên tục và chính xác*
+
+---
 
