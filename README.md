@@ -852,15 +852,15 @@ GO
 -- Demo chuỗi Trigger: Cập nhật hợp đồng sang "Đã thanh lý"
 UPDATE [HopDong]
 SET [TrangThai] = N'Đã thanh lý'
-WHERE [MaHopDong] = 4;
+WHERE [MaHopDong] = 3;
 
 -- Kiểm tra: Tài sản đã tự động đổi sang "Đã bán thanh lý" chưa?
 SELECT [MaTaiSan], [TenTaiSan], [TrangThai]
 FROM [TaiSan]
-WHERE [MaHopDong] = 4;
+WHERE [MaHopDong] = 3;
 ```
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/8f7362bc-7260-4e46-a304-e90c4f8407ca" />
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/59257906-8b32-4be4-9f27-8a33b3a0c11b" />
 
 *Tab Messages hiển thị "[Trigger 3]: Da chuyen tai san sang Đã bán thanh lý". Bảng TaiSan tự động cập nhật — không cần nhân viên nhớ chạy lệnh UPDATE riêng cho từng tài sản*
 
