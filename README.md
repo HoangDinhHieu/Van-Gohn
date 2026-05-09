@@ -36,6 +36,7 @@ Hệ thống quản lý các hợp đồng vay tiền thế chấp tài sản (c
 
 ## 2. Sơ đồ ERD
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/d7f4137a-7c85-42e3-8d12-5b2e63ac3b71" />
 
 ### Các thực thể và mối quan hệ
 
