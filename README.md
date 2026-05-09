@@ -338,3 +338,345 @@ GO
 *Tab Messages: "Khách hàng đã tồn tại: Nguyễn Văn An" — SP không tạo hồ sơ trùng, chỉ tạo hợp đồng mới gắn MaKH cũ. Đảm bảo dữ liệu không bị duplicate*
 
 ---
+## Event 2: Tính Toán Công Nợ Thời Gian Thực
+
+### Ý Tưởng (Scenario): "Bộ máy tính tiền chạy ngầm mỗi giây"
+
+**Tình huống:** Khách hỏi "Hôm nay tôi nợ bao nhiêu?" — nhân viên không cần tính tay, chỉ cần gọi hàm với mã hợp đồng và ngày hôm nay. Hệ thống tự áp công thức lãi đơn hoặc lãi kép tùy vào thời điểm, trừ đi các khoản đã trả, trả về con số chính xác đến từng đồng.
+
+### fn_TinhLaiDon — Hàm hỗ trợ tính lãi đơn
+
+```sql
+CREATE FUNCTION [dbo].[fn_TinhLaiDon]
+(
+    @SoTienGoc  MONEY,
+    @SoNgay     INT
+)
+RETURNS MONEY
+AS
+BEGIN
+    -- Lãi suất: 5.000đ / 1.000.000đ / ngày = 0.5%/ngày
+    RETURN @SoTienGoc * 0.005 * @SoNgay;
+END;
+GO
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/4cc2bf93-4af8-417a-abc8-516f21c5629f" />
+
+
+### fn_CalcMoneyTransaction — Tính nợ 1 hợp đồng đến ngày cụ thể
+
+**Luồng xử lý tổng quát:**
+
+- **Bước 1.** Lấy thông tin hợp đồng: `SoTienVay`, `NgayVay`, `Deadline1`
+- **Bước 2.** So sánh `TargetDate` với `Deadline1`
+- **Bước 3.** Nếu `TargetDate ≤ Deadline1` → tính lãi đơn: `Gốc × 0.005 × SoNgay`
+- **Bước 4.** Nếu `TargetDate > Deadline1` → tính nợ tại Deadline1, sau đó áp lãi kép: `GốcMới × (1.005)^N`
+- **Bước 5.** Trừ đi tổng các khoản đã trả trong `LichSuThanhToan`
+- **Bước 6.** Trả về dư nợ thực tế (tối thiểu = 0)
+
+```sql
+CREATE FUNCTION [dbo].[fn_CalcMoneyTransaction]
+(
+    @MaHopDong  INT,
+    @TargetDate DATE
+)
+RETURNS MONEY
+AS
+BEGIN
+    DECLARE @SoTienVay  MONEY;
+    DECLARE @NgayVay    DATE;
+    DECLARE @Deadline1  DATE;
+    DECLARE @TongNo     MONEY = 0;
+
+    SELECT
+        @SoTienVay = [SoTienVay],
+        @NgayVay   = [NgayVay],
+        @Deadline1 = [Deadline1]
+    FROM [HopDong]
+    WHERE [MaHopDong] = @MaHopDong;
+
+    IF @SoTienVay IS NULL RETURN 0;
+
+    -- Giai đoạn 1: Lãi đơn (TargetDate còn trong hạn)
+    IF @TargetDate <= @Deadline1
+    BEGIN
+        DECLARE @SoNgayDon INT = DATEDIFF(DAY, @NgayVay, @TargetDate);
+        SET @TongNo = @SoTienVay + dbo.[fn_TinhLaiDon](@SoTienVay, @SoNgayDon);
+    END
+    -- Giai đoạn 2: Lãi kép (TargetDate đã vượt Deadline1)
+    ELSE
+    BEGIN
+        -- Tính nợ tại Deadline1
+        DECLARE @SoNgayDenD1 INT = DATEDIFF(DAY, @NgayVay, @Deadline1);
+        DECLARE @NoDiD1 MONEY =
+            @SoTienVay + dbo.[fn_TinhLaiDon](@SoTienVay, @SoNgayDenD1);
+
+        -- Áp lãi kép từ Deadline1 → TargetDate
+        -- Dùng hàm POWER() để tính lũy thừa: GốcMới × (1.005)^N
+        DECLARE @SoNgayKep INT = DATEDIFF(DAY, @Deadline1, @TargetDate);
+        SET @TongNo = @NoDiD1 * POWER(CAST(1.005 AS FLOAT), @SoNgayKep);
+    END
+
+    -- Trừ các khoản đã trả trong LichSuThanhToan
+    DECLARE @DaTra MONEY = 0;
+    SELECT @DaTra = ISNULL(SUM([SoTienTra]), 0)
+    FROM [LichSuThanhToan]
+    WHERE [MaHopDong] = @MaHopDong
+      AND CAST([NgayTra] AS DATE) <= @TargetDate;
+
+    SET @TongNo = @TongNo - @DaTra;
+    IF @TongNo < 0 SET @TongNo = 0;
+
+    RETURN CAST(@TongNo AS MONEY);
+END;
+GO
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/18dce849-36e3-4947-90dd-9308f7e8e97f" />
+
+*Tạo Function `fn_CalcMoneyTransaction` — dùng `POWER()` cho lãi kép, tự động trừ khoản đã trả từ LichSuThanhToan*
+
+```sql
+-- Khai thác: Tính nợ hợp đồng số 1 đến hôm nay
+SELECT
+    dbo.[fn_CalcMoneyTransaction](1, CAST(GETDATE() AS DATE))
+    AS [TongNoHopDong1_HomNay];
+
+-- Khai thác: Tính nợ hợp đồng số 2 đến ngày cụ thể
+SELECT
+    dbo.[fn_CalcMoneyTransaction](2, '2026-06-15')
+    AS [TongNoHopDong2_Den15Thang6];
+```
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/64ba9ed9-6fac-4fe6-a24d-22e53aa8e0b0" />
+
+*Hàm trả về số tiền nợ chính xác — đã áp đúng giai đoạn lãi đơn hoặc lãi kép tùy ngày, đã trừ các khoản từng trả*
+
+---
+
+### fn_CalcMoneyContract — Tính tổng nợ của 1 khách hàng
+
+**Tình huống:** Khách có 3 hợp đồng đang còn nợ. Kế toán cần biết tổng dư nợ toàn bộ các hợp đồng của khách đó đến ngày hôm nay.
+
+**Luồng xử lý:**
+- Dùng CURSOR duyệt qua tất cả hợp đồng chưa kết thúc của khách
+- Gọi `fn_CalcMoneyTransaction` cho từng hợp đồng
+- Cộng dồn vào tổng
+
+```sql
+CREATE FUNCTION [dbo].[fn_CalcMoneyContract]
+(
+    @MaKhachHang    INT,
+    @TargetDate     DATE
+)
+RETURNS MONEY
+AS
+BEGIN
+    DECLARE @TongNo MONEY = 0;
+    DECLARE @MaHD   INT;
+
+    -- Dùng CURSOR để duyệt từng hợp đồng chưa kết thúc
+    DECLARE cur_HD CURSOR FOR
+        SELECT [MaHopDong]
+        FROM [HopDong]
+        WHERE [MaKhachHang] = @MaKhachHang
+          AND [TrangThai] NOT IN (N'Đã thanh toán', N'Đã thanh lý');
+
+    OPEN cur_HD;
+    FETCH NEXT FROM cur_HD INTO @MaHD;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @TongNo = @TongNo
+            + dbo.[fn_CalcMoneyTransaction](@MaHD, @TargetDate);
+        FETCH NEXT FROM cur_HD INTO @MaHD;
+    END;
+
+    CLOSE cur_HD;
+    DEALLOCATE cur_HD;
+
+    RETURN @TongNo;
+END;
+GO
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/a654d801-67a6-4ceb-aef7-570ceceb4126" />
+
+*`fn_CalcMoneyContract` dùng CURSOR để gọi lại `fn_CalcMoneyTransaction` cho từng hợp đồng — đảm bảo logic tính lãi nhất quán*
+
+```sql
+-- Khai thác: Tổng nợ tất cả hợp đồng của khách hàng số 1 đến hôm nay
+SELECT
+    kh.[HoTen],
+    dbo.[fn_CalcMoneyContract](1, CAST(GETDATE() AS DATE))
+    AS [TongNoCuaKhachHang1]
+FROM [KhachHang] kh WHERE kh.[MaKhachHang] = 1;
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/fd7972a3-fdce-436b-b5af-e113e17fe1f1" />
+
+*Kết quả tổng hợp dư nợ tất cả hợp đồng đang hoạt động của 1 khách — hữu ích khi khách có nhiều lần vay*
+
+---
+## Event 3: Xử Lý Trả Nợ và Hoàn Trả Tài Sản
+
+### Ý Tưởng (Scenario): "Quầy thu tiền — mỗi xu đều được ghi lại, không bao giờ mất vết"
+
+**Tình huống:** Khách đến trả 2 triệu cho khoản nợ 5 triệu. Nhân viên cần: tính chính xác dư nợ hiện tại (có lãi kép), ghi log khoản trả, cập nhật trạng thái hợp đồng, và đưa ra gợi ý tài sản nào có thể trả lại cho khách ngay hôm nay.
+
+### Luồng Xử Lý Tổng Quát
+
+- **Bước 1.** Kiểm tra trạng thái hợp đồng — nếu `'Đã thanh lý'` thì thông báo và thoát
+- **Bước 2.** Tính dư nợ thực tế hôm nay bằng `fn_CalcMoneyTransaction`
+- **Bước 3.** Nếu `SoTienTra > DuNo` thì chỉ thu đúng phần dư nợ
+- **Bước 4.** INSERT vào `LichSuThanhToan` (audit log — không ghi đè)
+- **Bước 5a.** Nếu trả đủ → cập nhật `HopDong` thành `'Đã thanh toán'`, tất cả `TaiSan` thành `'Đã trả khách'`
+- **Bước 5b.** Nếu chưa đủ → cập nhật `HopDong` thành `'Đang trả góp'`
+- **Bước 6.** Xuất danh sách gợi ý tài sản có thể trả lại: điều kiện `GiaTriTaiSanConLai ≥ DuNoConLai`
+
+```sql
+CREATE PROCEDURE [dbo].[sp_XuLyTraNo]
+    @MaHopDong      INT,
+    @SoTienTra      MONEY,
+    @NhanVienThu    NVARCHAR(150)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Lấy thông tin hợp đồng
+    DECLARE @TrangThaiHD NVARCHAR(30);
+    SELECT @TrangThaiHD = [TrangThai]
+    FROM [HopDong] WHERE [MaHopDong] = @MaHopDong;
+
+    IF @TrangThaiHD IS NULL
+    BEGIN
+        RAISERROR(N'Hợp đồng không tồn tại!', 16, 1); RETURN;
+    END
+
+    -- Bước 1: Tài sản đã thanh lý → từ chối thu tiền
+    IF @TrangThaiHD = N'Đã thanh lý'
+    BEGIN
+        PRINT N'[TU CHOI] Hop dong da bi thanh ly tai san.';
+        PRINT N'Khong thu tien, khong tra do.';
+        RETURN;
+    END
+
+    IF @TrangThaiHD = N'Đã thanh toán'
+    BEGIN
+        PRINT N'Hop dong nay da duoc thanh toan day du.';
+        RETURN;
+    END
+
+    -- Bước 2: Tính dư nợ hiện tại
+    DECLARE @NgayHomNay DATE = CAST(GETDATE() AS DATE);
+    DECLARE @DuNo MONEY =
+        dbo.[fn_CalcMoneyTransaction](@MaHopDong, @NgayHomNay);
+
+    PRINT N'Du no hien tai: ' + FORMAT(@DuNo, 'N0') + N'd';
+    PRINT N'So tien KH tra: ' + FORMAT(@SoTienTra, 'N0') + N'd';
+
+    -- Bước 3: Chỉ thu tối đa bằng dư nợ
+    IF @SoTienTra > @DuNo
+    BEGIN
+        PRINT N'[DIEU CHINH] Chi thu: ' + FORMAT(@DuNo, 'N0') + N'd';
+        SET @SoTienTra = @DuNo;
+    END
+
+    DECLARE @DuNoSau MONEY = @DuNo - @SoTienTra;
+
+    -- Bước 4: Ghi vào LichSuThanhToan (audit log)
+    INSERT INTO [LichSuThanhToan]
+        ([MaHopDong],[NgayTra],[SoTienTra],[NhanVienThu],[DuNoTruocKhi],[DuNoSauKhi])
+    VALUES
+        (@MaHopDong, GETDATE(), @SoTienTra, @NhanVienThu, @DuNo, @DuNoSau);
+
+    -- Bước 5: Cập nhật trạng thái
+    IF @DuNoSau = 0
+    BEGIN
+        -- Trả đủ: đóng hợp đồng và trả hết đồ
+        UPDATE [HopDong] SET [TrangThai] = N'Đã thanh toán'
+        WHERE [MaHopDong] = @MaHopDong;
+
+        UPDATE [TaiSan] SET [TrangThai] = N'Đã trả khách'
+        WHERE [MaHopDong] = @MaHopDong AND [TrangThai] = N'Đang cầm cố';
+
+        PRINT N'[THANH CONG] Thanh toan du! Toan bo tai san da tra lai cho khach.';
+    END
+    ELSE
+    BEGIN
+        -- Trả một phần
+        UPDATE [HopDong] SET [TrangThai] = N'Đang trả góp'
+        WHERE [MaHopDong] = @MaHopDong;
+
+        PRINT N'[GHI NHAN] Da tra mot phan. Du no con lai: '
+            + FORMAT(@DuNoSau, 'N0') + N'd';
+
+        -- Bước 6: Gợi ý tài sản có thể trả lại cho khách
+        -- Điều kiện: Tổng giá trị tài sản CÒN LẠI sau khi trả bớt
+        --            vẫn >= Dư nợ còn lại
+        SELECT
+            ts.[MaTaiSan],
+            ts.[TenTaiSan],
+            FORMAT(ts.[GiaTriDinhGia], 'N0') AS [GiaTriDinhGia],
+            FORMAT(
+                (SELECT ISNULL(SUM(ts2.[GiaTriDinhGia]),0)
+                 FROM [TaiSan] ts2
+                 WHERE ts2.[MaHopDong] = @MaHopDong
+                   AND ts2.[TrangThai] = N'Đang cầm cố'
+                   AND ts2.[MaTaiSan] <> ts.[MaTaiSan])
+            , 'N0') AS [GiaTriConLaiNeuTraMon],
+            CASE
+                WHEN (SELECT ISNULL(SUM(ts2.[GiaTriDinhGia]),0)
+                      FROM [TaiSan] ts2
+                      WHERE ts2.[MaHopDong] = @MaHopDong
+                        AND ts2.[TrangThai] = N'Đang cầm cố'
+                        AND ts2.[MaTaiSan] <> ts.[MaTaiSan])
+                     >= @DuNoSau
+                THEN N'Co the tra lai cho khach'
+                ELSE N'Chua du dieu kien'
+            END AS [GopY]
+        FROM [TaiSan] ts
+        WHERE ts.[MaHopDong] = @MaHopDong
+          AND ts.[TrangThai] = N'Đang cầm cố'
+        ORDER BY ts.[GiaTriDinhGia] DESC;
+    END
+END;
+GO
+```
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/5e30265b-3e07-4adf-86a1-793d28890cbe" />
+
+*Tạo Stored Procedure `sp_XuLyTraNo` thành công*
+
+```sql
+-- Khai thác: Khách trả 2 triệu cho hợp đồng số 1
+EXEC [dbo].[sp_XuLyTraNo]
+    @MaHopDong   = 1,
+    @SoTienTra   = 2000000,
+    @NhanVienThu = N'Hoàng Đình Hiếu';
+GO
+```
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/6a668427-c3bd-4564-9b7e-307e167f586a" />
+
+
+*Tab Messages: Dư nợ trước/sau khi trả. Tab Results: Danh sách gợi ý tài sản có thể hoàn trả — cột GopY = "Co the tra lai" nghĩa là giá trị tài sản còn lại vẫn đủ bảo đảm cho khoản dư nợ*
+
+```sql
+-- Kiểm tra LichSuThanhToan sau khi trả
+SELECT
+    lst.[MaLichSu],
+    kh.[HoTen],
+    lst.[MaHopDong],
+    FORMAT(lst.[SoTienTra],    'N0') AS [SoTienTra],
+    FORMAT(lst.[DuNoTruocKhi], 'N0') AS [DuNoTruocKhi],
+    FORMAT(lst.[DuNoSauKhi],   'N0') AS [DuNoSauKhi],
+    lst.[NhanVienThu]
+FROM [LichSuThanhToan] lst
+JOIN [HopDong] hd   ON lst.[MaHopDong]  = hd.[MaHopDong]
+JOIN [KhachHang] kh ON hd.[MaKhachHang] = kh.[MaKhachHang]
+ORDER BY lst.[NgayTra] DESC;
+```
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/3054fcff-81f8-4216-b424-993c27b385a4" />
+
+*Bảng LichSuThanhToan ghi lại đầy đủ: ai trả, bao nhiêu, dư nợ trước và sau — không bao giờ ghi đè, không mất dấu vết dòng tiền*
+
+---
+
